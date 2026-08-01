@@ -1,0 +1,106 @@
+name: Build Exam Voice Browser APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+    steps:
+      - name: Ambil source dari repository
+        uses: actions/checkout@v4
+
+      - name: Cari lokasi proyek Android
+        shell: bash
+        run: |
+          if [ -f "settings.gradle" ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+          elif [ -f "ExamVoiceBrowser/settings.gradle" ]; then
+            echo "PROJECT_DIR=ExamVoiceBrowser" >> "$GITHUB_ENV"
+          else
+            echo "ERROR: settings.gradle tidak ditemukan."
+            find . -maxdepth 4 -type f | sort
+            exit 1
+          fi
+
+      - name: Pasang Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Pasang Android SDK command-line tools
+        uses: android-actions/setup-android@v3
+
+      - name: Pasang Android SDK 36
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Pasang Gradle 9.4.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.4.1"
+
+      - name: Buat Gradle Wrapper bila belum ada
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ ! -f "./gradlew" ]; then
+            gradle wrapper --gradle-version 9.4.1
+          fi
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: Siapkan keystore rilis tetap
+        shell: bash
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && \
+             [ -n "$ANDROID_KEYSTORE_PASSWORD" ] && \
+             [ -n "$ANDROID_KEY_ALIAS" ] && \
+             [ -n "$ANDROID_KEY_PASSWORD" ]; then
+            KEYSTORE_PATH="$RUNNER_TEMP/examvoice-release.jks"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+            echo "ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+            echo "HAS_RELEASE_KEY=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_RELEASE_KEY=false" >> "$GITHUB_ENV"
+            echo "Keystore rilis belum diatur. Workflow hanya membuat APK debug."
+          fi
+
+      - name: Buat APK debug
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: ./gradlew clean assembleDebug --no-daemon --stacktrace
+
+      - name: Buat APK release bertanda tangan tetap
+        if: env.HAS_RELEASE_KEY == 'true'
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Simpan APK sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExamVoiceBrowser-v1.1.4-apk
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
