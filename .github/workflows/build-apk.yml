@@ -2,14 +2,28 @@ name: Build Exam Voice Browser APK
 
 on:
   workflow_dispatch:
-
   push:
     branches:
       - main
+    paths:
+      - "ExamVoiceBrowser_Source.zip"
+      - "ExamVoiceBrowser_Source_v1.1.4.zip"
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
 
 jobs:
   build:
+    name: Build Release APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
     steps:
       - name: Download source
@@ -29,29 +43,6 @@ jobs:
         with:
           gradle-version: "9.4.1"
 
-      - name: Extract and locate Android project
-        shell: bash
-        run: |
-          if [ -f "ExamVoiceBrowser_Source.zip" ]; then
-            echo "Mengekstrak ExamVoiceBrowser_Source.zip"
-            rm -rf ExamVoiceBrowser
-            unzip -q -o ExamVoiceBrowser_Source.zip
-          fi
-
-          if [ -f "settings.gradle" ]; then
-            PROJECT_DIR="."
-          elif [ -f "ExamVoiceBrowser/settings.gradle" ]; then
-            PROJECT_DIR="ExamVoiceBrowser"
-          else
-            echo "::error::settings.gradle tidak ditemukan"
-            echo "Isi repository:"
-            find . -maxdepth 4 -type f | sort
-            exit 1
-          fi
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Folder proyek: $PROJECT_DIR"
-
       - name: Install Android SDK 36
         shell: bash
         run: |
@@ -61,19 +52,129 @@ jobs:
             "platforms;android-36" \
             "build-tools;36.0.0"
 
-      - name: Build debug APK
+      - name: Extract and locate Android project
         shell: bash
         run: |
-          cd "$PROJECT_DIR"
-          gradle --version
-          gradle assembleDebug --stacktrace
+          set -euo pipefail
 
-      - name: Upload APK
+          EXTRACT_DIR="$RUNNER_TEMP/examvoice-source"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+
+          SOURCE_ZIP=""
+          for FILE in "ExamVoiceBrowser_Source.zip" "ExamVoiceBrowser_Source_v1.1.4.zip"; do
+            if [ -f "$FILE" ]; then
+              SOURCE_ZIP="$FILE"
+              break
+            fi
+          done
+
+          if [ -n "$SOURCE_ZIP" ]; then
+            echo "Mengekstrak $SOURCE_ZIP"
+            unzip -q -o "$SOURCE_ZIP" -d "$EXTRACT_DIR"
+            SEARCH_ROOT="$EXTRACT_DIR"
+          else
+            echo "ZIP source tidak ditemukan, memakai source yang sudah diekstrak di repository."
+            SEARCH_ROOT="$GITHUB_WORKSPACE"
+          fi
+
+          SETTINGS_FILE=$(find "$SEARCH_ROOT" -maxdepth 5 -type f \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            -print -quit)
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::settings.gradle atau settings.gradle.kts tidak ditemukan"
+            find "$SEARCH_ROOT" -maxdepth 5 -type f | sort
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Folder proyek: $PROJECT_DIR"
+
+      - name: Check release-signing secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MISSING=0
+          for NAME in \
+            ANDROID_KEYSTORE_BASE64 \
+            ANDROID_KEYSTORE_PASSWORD \
+            ANDROID_KEY_ALIAS \
+            ANDROID_KEY_PASSWORD; do
+            if [ -z "${!NAME:-}" ]; then
+              echo "::error::GitHub Secret $NAME belum diisi"
+              MISSING=1
+            fi
+          done
+
+          if [ "$MISSING" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Prepare permanent release keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KEYSTORE_PATH="$RUNNER_TEMP/examvoice-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+
+          keytool -list \
+            -keystore "$KEYSTORE_PATH" \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" > /dev/null
+
+          echo "ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+      - name: Prepare Gradle Wrapper
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "./gradlew" ]; then
+            gradle wrapper --gradle-version 9.4.1
+          fi
+
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: Build signed release APK
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          ./gradlew clean assembleRelease --no-daemon --stacktrace
+
+      - name: Locate and verify APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_FILE=$(find "$PROJECT_DIR/app/build/outputs/apk/release" \
+            -maxdepth 1 -type f -name "*.apk" ! -name "*unsigned*" \
+            -print -quit)
+
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::APK release bertanda tangan tidak ditemukan"
+            find "$PROJECT_DIR/app/build/outputs" -type f | sort || true
+            exit 1
+          fi
+
+          FINAL_APK="$RUNNER_TEMP/ExamVoiceBrowser-v1.1.4-release.apk"
+          cp "$APK_FILE" "$FINAL_APK"
+
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner"
+          "$APKSIGNER" verify --verbose --print-certs "$FINAL_APK"
+
+          echo "APK_PATH=$FINAL_APK" >> "$GITHUB_ENV"
+
+      - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
-          name: ExamVoiceBrowser-debug
-          path: |
-            app/build/outputs/apk/debug/*.apk
-            ExamVoiceBrowser/app/build/outputs/apk/debug/*.apk
+          name: ExamVoiceBrowser-v1.1.4-release
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 30
